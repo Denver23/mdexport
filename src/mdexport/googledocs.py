@@ -165,12 +165,23 @@ def _resolve_folder_path(drive, folder_id: str, cache: dict) -> str:
     return path
 
 
-def _export_doc_as_md(drive, doc_id: str) -> str:
-    """Export a Google Doc as HTML, then convert to Markdown."""
-    html = drive.files().export(
-        fileId=doc_id,
-        mimeType="text/html",
-    ).execute()
+def _export_too_large(error: HttpError) -> bool:
+    return error.resp.status == 403 and b"exportSizeLimitExceeded" in error.content
+
+
+def _export_doc_as_md(drive, doc_id: str, title: str) -> str:
+    """Export as HTML Markdown, falling back to plain text for large docs."""
+    try:
+        html = drive.files().export(
+            fileId=doc_id,
+            mimeType="text/html",
+        ).execute()
+    except HttpError as error:
+        if not _export_too_large(error):
+            raise
+        click.echo(f"  '{title}' exceeds Google's HTML export limit; trying plain text")
+        text = drive.files().export(fileId=doc_id, mimeType="text/plain").execute()
+        return text.decode("utf-8").strip() if isinstance(text, bytes) else text.strip()
     if isinstance(html, bytes):
         html = html.decode("utf-8")
     md = html_to_md(html, heading_style="ATX", strip=["img"])
@@ -248,9 +259,13 @@ def export_google_docs(
             continue
 
         try:
-            body_md = _export_doc_as_md(drive, doc_id)
+            body_md = _export_doc_as_md(drive, doc_id, title)
         except HttpError as e:
             status = e.resp.status if hasattr(e, 'resp') else 0
+            if _export_too_large(e):
+                click.echo(f"  Skipping '{title}': too large even for plain-text export")
+                errors += 1
+                continue
             if status in (401, 403):
                 _check_auth_error(e)
             click.echo(f"  Skipping '{title}': HTTP {status}")
