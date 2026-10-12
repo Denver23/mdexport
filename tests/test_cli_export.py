@@ -6,9 +6,11 @@ from click.testing import CliRunner
 from slack_sdk import WebClient
 from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler, ServerErrorRetryHandler
 
-from mdexport import slack_export
+from mdexport import notion_export, slack_export
 from mdexport.cli import cli
+from mdexport.notion_client import NotionError
 
+from .fake_notion import FakeNotion
 from .fake_slack import FakeClient
 
 TOKEN = "xoxb-test"
@@ -132,4 +134,114 @@ def test_help_lists_every_option():
     for option in ("--output", "--history-days", "--refetch-days", "--exclude", "--exclude-user", "--report"):
         assert option in result.output
     assert "dedicated" in result.output
+    assert "--token" not in result.output
+
+
+NOTION_TOKEN = "ntn_test"
+PAGE = "b0" * 16
+
+
+@pytest.fixture
+def notion_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NOTION_TOKEN", NOTION_TOKEN)
+    fake, seen = FakeNotion(), []
+    fake.pages[PAGE] = {
+        "object": "page", "id": PAGE, "url": f"https://www.notion.so/{PAGE}",
+        "last_edited_time": "2026-10-08T09:12:00.000Z", "parent": {"type": "workspace", "workspace": True},
+        "archived": False, "in_trash": False,
+        "properties": {"Name": {"type": "title", "title": [{"plain_text": "Plan", "href": None}]}},
+    }
+    fake.children[PAGE] = [{"object": "block", "id": "99" * 16, "type": "paragraph", "has_children": False,
+                            "paragraph": {"rich_text": [{"plain_text": "hello", "href": None}]}}]
+    monkeypatch.setattr(notion_export, "make_client", lambda token: seen.append(token) or fake)
+    return fake, seen
+
+
+def invoke_notion(tmp_path, *extra: str):
+    args = ["export", "notion", "--output", str(tmp_path / "out"), "--report", str(tmp_path / "report.json"), *extra]
+    return CliRunner().invoke(cli, args)
+
+
+@pytest.mark.parametrize("unset", [True, False])
+def test_notion_missing_token(tmp_path, notion_env, monkeypatch, unset):
+    if unset:
+        monkeypatch.delenv("NOTION_TOKEN")
+    else:
+        monkeypatch.setenv("NOTION_TOKEN", "")
+    result = invoke_notion(tmp_path)
+    assert result.exit_code == 1
+    assert "NOTION_TOKEN is not set" in result.output
+    assert notion_env[1] == []
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_notion_bad_exclude(tmp_path, notion_env):
+    result = invoke_notion(tmp_path, "--exclude", PAGE, "--exclude", "not-an-id")
+    assert result.exit_code == 1
+    assert "--exclude must be a Notion page or database id: not-an-id" in result.output
+    assert notion_env[1] == []
+    assert not (tmp_path / "out").exists()
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_notion_exclude_with_dashes_accepted(tmp_path, notion_env):
+    result = invoke_notion(tmp_path, "--exclude", "1A2B3C4D-5E6F-7A8B-9C0D-1E2F3A4B5C6D")
+    assert result.exit_code == 0, result.output
+    assert result.output == "Exported 1 roots, 1 pages (1 read), 0 unreadable\n"
+
+
+def test_notion_exclude_reaches_export(tmp_path, notion_env):
+    dashed = f"{PAGE[:8]}-{PAGE[8:12]}-{PAGE[12:16]}-{PAGE[16:20]}-{PAGE[20:]}".upper()
+    result = invoke_notion(tmp_path, "--exclude", dashed)
+    assert result.exit_code == 0, result.output
+    assert result.output == "Exported 0 roots, 0 pages (0 read), 0 unreadable; removal skipped: no roots kept\n"
+    assert not (tmp_path / "out" / PAGE / f"{PAGE}.md").exists()
+
+
+def test_notion_success_writes_report_and_summary(tmp_path, notion_env):
+    fake, seen = notion_env
+    result = invoke_notion(tmp_path)
+    assert result.exit_code == 0, result.output
+    assert result.output == "Exported 1 roots, 1 pages (1 read), 0 unreadable\n"
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert set(report) >= {"roots", "pages", "sections", "read", "removed", "pages_removed", "unreadable", "root_titles"}
+    assert report["root_titles"] == {PAGE: "Plan"}
+    assert (tmp_path / "out" / PAGE / f"{PAGE}.md").is_file()
+    assert seen == [NOTION_TOKEN]
+    assert fake.closed
+    assert NOTION_TOKEN not in result.output
+    leaked = [p for p in tmp_path.rglob("*") if p.is_file() and NOTION_TOKEN.encode() in p.read_bytes()]
+    assert leaked == []
+    assert not (tmp_path / ".mdexport").exists()
+    assert not list(tmp_path.glob(".report.json.*"))
+
+
+def test_notion_listing_failure(tmp_path, notion_env):
+    fake, _ = notion_env
+    fake.list_fail["page"] = NotionError(401, "unauthorized")
+    result = invoke_notion(tmp_path)
+    assert result.exit_code == 1
+    assert "Notion listing failed: unauthorized" in result.output
+    assert "Traceback" not in result.output
+    assert NOTION_TOKEN not in result.output
+    assert fake.closed
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_notion_removal_skipped_suffix(tmp_path, notion_env, monkeypatch):
+    zeros = {"roots": 0, "pages": 0, "sections": 0, "read": 0, "removed": [], "pages_removed": 0,
+             "unreadable": {}, "root_titles": {}, "removal_skipped": True}
+    monkeypatch.setattr(notion_export, "export", lambda client, out, **kw: zeros)
+    result = invoke_notion(tmp_path)
+    assert result.exit_code == 0, result.output
+    assert result.output == "Exported 0 roots, 0 pages (0 read), 0 unreadable; removal skipped: no roots kept\n"
+    assert json.loads((tmp_path / "report.json").read_text())["removal_skipped"] is True
+
+
+def test_notion_help():
+    result = CliRunner().invoke(cli, ["export", "notion", "--help"])
+    assert result.exit_code == 0
+    for text in ("--output", "--exclude", "--report", "NOTION_TOKEN", "OUTPUT/.state/", "dedicated", "shared"):
+        assert text in result.output
     assert "--token" not in result.output

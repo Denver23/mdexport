@@ -188,6 +188,35 @@ Exported 2 channels, 120 messages, 1 unreadable
 
 A channel that cannot be read is listed under `unreadable` and keeps its earlier files. A run that keeps no channel adds `"removal_skipped": true` to the report and `; removal skipped: no channels kept` to the line. If the workspace, its users or its channels cannot be listed, the command exits 1, writes no report and changes nothing.
 
+### `mdexport export notion` — One-off Notion export
+
+```bash
+NOTION_TOKEN=ntn_... mdexport export notion --output ./notion --report ./notion-report.json
+
+# Skip a page or database and everything under it
+NOTION_TOKEN=ntn_... mdexport export notion -o ./notion --report ./notion-report.json \
+  --exclude 1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d
+```
+
+Options: `--exclude` page or database id, with or without dashes, any case (repeatable), `--report` file for the JSON report (required).
+
+Exports every page and database row shared with the integration (see [Notion token setup](#notion-token-setup)); sharing a page shares the pages under it, and unsharing removes them at the next run. The token comes only from `NOTION_TOKEN` and is never printed or stored. Nothing is read from or written to `~/.mdexport/registry.json`.
+
+Writes one file per page, `OUTPUT/<root id>/<page id>.md`, in a folder per root (the topmost shared page or database above it), with a `##` item per heading and a link under each, and a state file per page in `OUTPUT/.state/`. Ids are 32 lowercase hex digits without dashes. A page is read again only when its edit time, path or the file format changed, or when it was edited within a minute of its last read. **The output directory is dedicated to this export:** a page that is no longer shared, is trashed or is excluded has its file and state deleted; a page missing from Notion's listing is first checked directly and kept while it can still be read. A root folder is removed once it holds nothing else. Only names shaped like an id are ever deleted.
+
+On success the report is written to `--report` and one line is printed:
+
+```json
+{"roots": 12, "pages": 340, "sections": 1290, "read": 18, "removed": ["<root id>"], "pages_removed": 2,
+ "unreadable": {"<page id>": "<error>"}, "root_titles": {"<root id>": "Clients"}}
+```
+
+```
+Exported 12 roots, 340 pages (18 read), 1 unreadable
+```
+
+`roots` and `pages` count what is kept, `sections` the `##` items in kept files, `read` the pages read this run, `removed` the roots whose pages were all removed this run (a folder still holding other files stays on disk), `pages_removed` the page files deleted. A page that cannot be read is listed under `unreadable` and keeps its earlier file. A run that keeps no page deletes nothing and adds `"removal_skipped": true` to the report and `; removal skipped: no roots kept` to the line. If the shared pages or databases cannot be listed, the command exits 1, writes no report and changes nothing.
+
 ## Authentication
 
 Tokens are loaded from environment variables or a `.env` file. See `.env.example` for all options.
@@ -215,7 +244,7 @@ You can also pass tokens directly via `--token` when adding a source.
 ### Notion token setup
 
 1. Go to https://www.notion.so/my-integrations
-2. Create a new integration with **Read content** capability
+2. Create a new internal integration with the **Read content** and **Read user information without email addresses** capabilities (user information resolves people properties to names)
 3. Copy the token (`ntn_...`)
 4. **Share** each page or database with your integration (open the page → ··· → Connections → Add your integration)
 

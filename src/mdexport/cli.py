@@ -341,6 +341,62 @@ def export_slack(output, history_days, refetch_days, exclude, exclude_user, repo
     click.echo(summary)
 
 
+@export_group.command("notion")
+@click.option("--output", "-o", type=click.Path(file_okay=False, path_type=Path), required=True,
+              help="Output directory, dedicated to this export: files of pages no longer shared or excluded are deleted")
+@click.option("--exclude", multiple=True,
+              help="Page or database id, dashes allowed, to skip with everything under it; repeatable")
+@click.option("--report", type=click.Path(dir_okay=False, path_type=Path), required=True,
+              help="File the run's JSON report is written to")
+def export_notion(output, exclude, report):
+    """Export every Notion page shared with the integration, one Markdown file per page.
+
+    The token is read only from the NOTION_TOKEN environment variable; an
+    internal integration needs Read content and Read user information without
+    email addresses. What is shared with the integration is collected, and
+    what is unshared is removed on the next run.
+
+    \b
+    Writes OUTPUT/<root id>/<page id>.md, a folder per topmost shared page or
+    database, and state in OUTPUT/.state/. A page no longer shared, trashed or
+    excluded has its file and state deleted; a page missing from the listing is
+    checked with Notion first and kept while still readable. A root folder is
+    removed once it holds nothing else. Only names shaped like a Notion id are
+    deleted, and nothing is deleted in a run that keeps no page.
+
+    \b
+    Examples:
+      NOTION_TOKEN=ntn_... mdexport export notion -o ./notion --report report.json
+      NOTION_TOKEN=ntn_... mdexport export notion -o ./notion --report report.json --exclude 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d
+    """
+    import json
+    import os
+    from mdexport import notion_export, slack_export
+    from mdexport.notion_render import compact_id
+
+    for value in exclude:
+        if not notion_export._ID.fullmatch(compact_id(value)):
+            raise click.ClickException(f"--exclude must be a Notion page or database id: {value}")
+    token = os.environ.get("NOTION_TOKEN")
+    if not token:
+        raise click.ClickException("NOTION_TOKEN is not set")
+
+    client = notion_export.make_client(token)
+    try:
+        result = notion_export.export(client, output, exclude=exclude)
+    except notion_export.ExportError as e:
+        raise click.ClickException(str(e)) from e
+    finally:
+        client.close()
+
+    slack_export._write_atomic(report, json.dumps(result, indent=2) + "\n")
+    summary = (f"Exported {result['roots']} roots, {result['pages']} pages ({result['read']} read), "
+               f"{len(result['unreadable'])} unreadable")
+    if result.get("removal_skipped"):
+        summary += "; removal skipped: no roots kept"
+    click.echo(summary)
+
+
 # --- list ---
 
 @cli.command("list")
