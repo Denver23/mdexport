@@ -13,13 +13,13 @@ pip install -e .          # Install in development mode
 mdexport --help           # CLI entry point (mdexport.cli:cli)
 ```
 
-Tests: `pip install -e '.[dev]'` then `pytest` (`tests/` covers `slack_export.py` and `mdexport export slack`). No linter or CI.
+Tests: `pip install -e '.[dev]'` then `pytest` (`tests/` covers `slack_export.py`, `notion_client.py`, `notion_render.py`, `notion_export.py`, `mdexport export slack` and `mdexport export notion`; `tests/fake_slack.py` and `tests/fake_notion.py` stand in for the APIs). No linter or CI.
 
 ## Architecture
 
-All source code lives in `src/mdexport/`. The codebase is small (~8 files):
+All source code lives in `src/mdexport/`. The codebase is small (~15 files):
 
-- **cli.py** — Click CLI commands: `add` (github/slack/telegram/gmail/linear/google-docs/notion), `list`, `remove`, `sync`
+- **cli.py** — Click CLI commands: `add` (github/slack/telegram/gmail/linear/google-docs/notion), `list`, `info`, `remove`, `sync`, `auth`, `chats`, `threads`, and `export` (slack/notion, no registry)
 - **registry.py** — JSON config persistence at `~/.mdexport/registry.json` (register/unregister/get/update_synced)
 - **github.py** — Exports issues, PRs, and wiki using PyGithub. Wiki is cloned via git subprocess.
 - **slack.py** — Exports channel messages using slack-sdk. Resolves user IDs to names, supports date-range filtering.
@@ -29,6 +29,9 @@ All source code lives in `src/mdexport/`. The codebase is small (~8 files):
 - **linear.py** — Exports team issues with comments and history via GraphQL (httpx).
 - **googledocs.py** — Exports Google Docs as Markdown via Drive API. Supports folder filtering and incremental sync by modifiedTime.
 - **notion.py** — Exports Notion pages as Markdown via REST API (httpx). Converts blocks to MD, supports page/database filtering and incremental sync by last_edited_time.
+- **notion_client.py** — Small Notion REST client over httpx (`Notion-Version: 2022-06-28`), at most 3 calls per second, retrying 429, 5xx and network errors; failures raise `NotionError` with Notion's code, never the token.
+- **notion_render.py** — Renders a Notion page and its blocks as Markdown: a `##` item per heading with its link on the next line, database-row properties, the Slack line escape, no code fences.
+- **notion_export.py** — Stateless `mdexport export notion`: every page shared with the integration as `<root id>/<page id>.md`, re-reading only changed pages, a state file per page in `.state/`, deletion of pages no longer shared or excluded and of root folders left empty, a JSON report; token only from `NOTION_TOKEN`, no registry.
 
 Each exporter follows the same pattern: authenticate via env var token → paginate through API → format as markdown → write files. GitHub, Linear, Google Docs, and Notion support incremental sync via `synced_at`.
 
