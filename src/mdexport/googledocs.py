@@ -139,8 +139,8 @@ def _paginate_files(drive, query: str) -> list[dict]:
     return files
 
 
-def _resolve_folder_path(drive, folder_id: str, cache: dict) -> str:
-    """Resolve a folder ID to its full path, caching results."""
+def _resolve_folder_path(drive, folder_id: str, cache: dict, roots: set[str]) -> str:
+    """Resolve a folder path within the selected export roots."""
     if folder_id in cache:
         return cache[folder_id]
     try:
@@ -153,16 +153,30 @@ def _resolve_folder_path(drive, folder_id: str, cache: dict) -> str:
         cache[folder_id] = ""
         return ""
     name = _slugify(folder.get("name", ""))
+    if folder_id in roots:
+        cache[folder_id] = name
+        return name
     # Stop at root folders (My Drive, shared drive roots)
     parents = folder.get("parents", [])
     if not parents:
         # This is a root — don't include its name in the path
         cache[folder_id] = ""
         return ""
-    parent_path = _resolve_folder_path(drive, parents[0], cache)
+    parent_path = _resolve_folder_path(drive, parents[0], cache, roots)
     path = f"{parent_path}/{name}" if parent_path else name
     cache[folder_id] = path
     return path
+
+
+def _existing_docs(out: Path) -> dict[str, Path]:
+    existing = {}
+    for path in out.rglob("*.md"):
+        with path.open(errors="replace") as file:
+            header = file.read(2048)
+        match = re.search(r"^- \*\*Link:\*\* https://docs\.google\.com/document/d/([^/\s]+)", header, re.M)
+        if match:
+            existing[match.group(1)] = path
+    return existing
 
 
 def _export_too_large(error: HttpError) -> bool:
@@ -206,6 +220,12 @@ def export_google_docs(
         since_dt = datetime.fromisoformat(since)
         click.echo(f"Incremental sync since {since_dt.strftime('%Y-%m-%d %H:%M')}")
 
+    roots = set(folder_ids or [])
+    layout = out / ".mdexport-folder-roots"
+    layout_key = "\n".join(sorted(roots))
+    if roots and (not layout.exists() or layout.read_text() != layout_key):
+        since_dt = None
+
     click.echo("Listing documents...")
     try:
         docs = _list_docs(drive, folder_ids, since=since_dt)
@@ -222,7 +242,7 @@ def export_google_docs(
             fname = f"{_slugify(title)}-{doc_id[:8]}.md"
             doc_parents = doc.get("parents", [])
             if doc_parents:
-                folder_path = _resolve_folder_path(drive, doc_parents[0], folder_cache)
+                folder_path = _resolve_folder_path(drive, doc_parents[0], folder_cache, roots)
             else:
                 folder_path = ""
             if not folder_path:
@@ -234,6 +254,7 @@ def export_google_docs(
 
     out.mkdir(parents=True, exist_ok=True)
     folder_cache: dict[str, str] = {}
+    existing = _existing_docs(out) if roots else {}
     count = 0
     skipped = 0
     errors = 0
@@ -245,7 +266,7 @@ def export_google_docs(
         # Resolve folder path for subdirectory structure
         doc_parents = doc.get("parents", [])
         if doc_parents:
-            folder_path = _resolve_folder_path(drive, doc_parents[0], folder_cache)
+            folder_path = _resolve_folder_path(drive, doc_parents[0], folder_cache, roots)
         else:
             folder_path = ""
         if not folder_path:
@@ -253,6 +274,10 @@ def export_google_docs(
         doc_dir = out / folder_path
         doc_dir.mkdir(parents=True, exist_ok=True)
         fpath = doc_dir / fname
+
+        previous = existing.get(doc_id)
+        if previous and previous != fpath and not fpath.exists():
+            previous.rename(fpath)
 
         if _synced_today(fpath):
             skipped += 1
@@ -303,5 +328,7 @@ def export_google_docs(
     if errors:
         extra.append(f"{errors} errors")
     suffix = f" ({', '.join(extra)})" if extra else ""
+    if roots:
+        layout.write_text(layout_key)
     click.echo(f"  Exported {count} docs total{suffix}")
     click.echo(f"Done! Output: {out}")
