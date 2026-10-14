@@ -5,7 +5,7 @@ from pathlib import Path
 @click.group()
 @click.pass_context
 def cli(ctx):
-    """Export GitHub, Slack, Telegram, Gmail, Linear, Google Docs, and Notion data to local Markdown files."""
+    """Export GitHub, Slack, Telegram, Gmail, Linear, Google Docs, Notion and Granola data to local Markdown files."""
     ctx.ensure_object(dict)
 
 
@@ -397,6 +397,55 @@ def export_notion(output, exclude, report):
     click.echo(summary)
 
 
+def _places(place: tuple) -> dict:
+    places = {}
+    for item in place:
+        name, sep, folder = item.partition("=")
+        if not sep or not name.strip() or not folder.strip():
+            raise click.ClickException(f"--place takes Name=folder, got '{item}'.")
+        places[name.strip()] = str(Path(folder.strip()).expanduser().resolve())
+    return places
+
+
+def _links(link: tuple, places: dict) -> dict:
+    links = {}
+    for item in link:
+        folder, sep, place = item.partition("=")
+        if not sep or place not in places:
+            raise click.ClickException(f"--link takes fol_ID=Place with a place given by --place, got '{item}'.")
+        links[folder] = place
+    return links
+
+
+@add.command("granola")
+@click.option("--name", "-n", required=True, help="Name for this export")
+@click.option("--token", envvar="GRANOLA_TOKEN", required=True, help="Granola API key (grn_...)")
+@click.option("--place", "-p", multiple=True, required=True, help="A place meetings go to, as Name=folder; repeat for each")
+@click.option("--folder", "-f", multiple=True, help="Granola folder ID(s) to export (default: all meetings)")
+@click.option("--link", "-l", multiple=True, help="Send a Granola folder's meetings to a place, as fol_ID=Place")
+@click.option("--output", "-o", type=click.Path(), help="Ignored; meetings go to their places")
+def add_granola(name, token, place, folder, link, output):
+    """Add a Granola export. Each meeting goes to one place; a meeting of a
+    series that already has a place follows it, the others wait to be sorted
+    with 'mdexport granola file'."""
+    from mdexport.registry import register
+
+    places = _places(place)
+    register(name, {
+        "type": "granola",
+        "output": next(iter(places.values())),
+        "token": token,
+        "folder_ids": list(folder) if folder else None,
+        "places": places,
+        "folder_places": _links(link, places),
+        "series": {},
+        "notes": {},
+        "files": {},
+        "pending": [],
+    })
+    click.echo(f"Added Granola export '{name}' -> {', '.join(places)}")
+
+
 # --- list ---
 
 @cli.command("list")
@@ -452,6 +501,8 @@ def _describe_source(cfg: dict) -> str:
         if dbs:
             parts.append(f"{len(dbs)} database(s)")
         return ", ".join(parts) if parts else "all shared pages"
+    elif t == "granola":
+        return f"{len(cfg.get('places') or {})} place(s), {len(cfg.get('pending') or [])} to sort"
     return ""
 
 
@@ -511,6 +562,12 @@ def info(name):
             click.echo(f"Databases: {', '.join(dbs)}")
         if not pages and not dbs:
             click.echo("Scope:   all shared pages")
+    elif cfg["type"] == "granola":
+        folders = cfg.get("folder_ids")
+        click.echo(f"Folders: {', '.join(folders) if folders else 'all meetings'}")
+        for place, folder in (cfg.get("places") or {}).items():
+            click.echo(f"Place:   {place} -> {folder}")
+        click.echo(f"To sort: {len(cfg.get('pending') or [])}")
 
     added = cfg.get("added_at", "unknown")
     if added and added != "unknown":
@@ -726,6 +783,11 @@ def sync(name, full, dry_run):
 
 def _resolve_token(cfg: dict) -> str:
     token = cfg.get("token")
+    if cfg.get("type") == "granola" and (token or "").startswith("browser:"):
+        import os
+        token = os.environ.get("GRANOLA_TOKEN")
+        if not token or not token.startswith("eyJ"):
+            raise click.ClickException("Sign in to Granola again. No browser session for this export.")
     if not token:
         raise click.ClickException(f"No token stored for '{cfg['type']}' export. Re-add with --token.")
     return token
@@ -807,5 +869,105 @@ def _sync_one(name: str, cfg: dict):
             since=since,
         )
 
+    elif t == "granola":
+        token = _resolve_token(cfg)
+        from mdexport.granola import export_granola
+        from mdexport.registry import update_config
+        if cfg.get("_dry_run"):
+            raise click.ClickException("--dry-run is not supported for granola exports.")
+        done = export_granola(token, cfg, since=since)
+        update_config(name, {k: done[k] for k in ("files", "pending", "series")})
+
     else:
         raise click.ClickException(f"Unknown export type: {t}")
+
+
+# --- granola ---
+
+@cli.group()
+def granola():
+    """Sort Granola meetings into their places."""
+
+
+def _granola_cfg(name: str) -> dict:
+    from mdexport.registry import get
+    cfg = get(name)
+    if not cfg:
+        raise click.ClickException(f"Export '{name}' not found. Run 'mdexport list'.")
+    if cfg["type"] != "granola":
+        raise click.ClickException("This is only for granola exports.")
+    return cfg
+
+
+@granola.command("pending")
+@click.argument("name")
+def granola_pending(name):
+    """Print the meetings waiting for a place, with a guess each, as JSON."""
+    import json
+    from mdexport.granola import guess
+    cfg = _granola_cfg(name)
+    click.echo(json.dumps([{**p, "guess": guess(cfg, p.get("emails") or [])} for p in cfg.get("pending") or []]))
+
+
+@granola.command("meetings")
+@click.argument("name")
+def granola_meetings(name):
+    """Print the saved meetings with their place and file, as JSON."""
+    import json
+    cfg = _granola_cfg(name)
+    click.echo(json.dumps([{"id": nid, **f, "path": str(Path((cfg.get("places") or {}).get(f["place"], ""), f["file"]))} for nid, f in (cfg.get("files") or {}).items()]))
+
+
+@granola.command("file")
+@click.argument("name")
+@click.argument("note_id")
+@click.argument("place")
+@click.option("--only-this", "scope", flag_value="one", help="Only this meeting, not the rest of its series")
+@click.option("--series", "scope", flag_value="series", help="This meeting and the whole series, moving saved ones")
+def granola_file(name, note_id, place, scope):
+    """Give a meeting a place and write it. Waiting meetings of its series follow."""
+    from mdexport.granola import file_note
+    from mdexport.registry import update_config
+    cfg = _granola_cfg(name)
+    if place not in (cfg.get("places") or {}):
+        raise click.ClickException(f"No place '{place}'. Places: {', '.join(cfg.get('places') or {})}")
+    done = file_note(_resolve_token(cfg), cfg, note_id, place, scope or "auto")
+    update_config(name, {k: cfg.get(k) for k in ("files", "pending", "series", "notes")})
+    click.echo(f"Saved {len(done)} meeting(s) to {place}")
+
+
+@granola.command("places")
+@click.argument("name")
+@click.option("--place", "-p", multiple=True, required=True, help="Every place, as Name=folder")
+@click.option("--link", "-l", multiple=True, help="Send a Granola folder's meetings to a place, as fol_ID=Place")
+def granola_places(name, place, link):
+    """Replace the places. Files of a removed place stay where they are; its rules are dropped."""
+    from mdexport.registry import update_config
+    cfg = _granola_cfg(name)
+    places = _places(place)
+    renamed = {old: new for old, folder in (cfg.get("places") or {}).items() for new, f in places.items() if f == folder and old != new and old not in places}
+    keep = lambda m: {k: renamed.get(v, v) for k, v in (m or {}).items() if renamed.get(v, v) in places}
+    files = {nid: {**f, "place": renamed.get(f["place"], f["place"])} for nid, f in (cfg.get("files") or {}).items()}
+    update_config(name, {
+        "places": places,
+        "output": next(iter(places.values())),
+        "folder_places": _links(link, places),
+        "folder_ids": list(dict.fromkeys([*cfg["folder_ids"], *_links(link, places)])) if cfg.get("folder_ids") else None,
+        "synced_at": None,
+        "series": keep(cfg.get("series")),
+        "notes": keep(cfg.get("notes")),
+        "files": files,
+    })
+    click.echo(f"Places for '{name}': {', '.join(places)}")
+
+
+@granola.command("folders")
+def granola_folders():
+    """Print the Granola folders the key in GRANOLA_TOKEN can read, as JSON."""
+    import json
+    import os
+    from mdexport.granola import list_folders
+    token = os.environ.get("GRANOLA_TOKEN")
+    if not token:
+        raise click.ClickException("Set GRANOLA_TOKEN.")
+    click.echo(json.dumps(list_folders(token)))

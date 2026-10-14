@@ -1,6 +1,6 @@
 # mdexport
 
-Export data from GitHub, Slack, Telegram, Gmail, Linear, Google Docs, and Notion into local Markdown files.
+Export data from GitHub, Slack, Telegram, Gmail, Linear, Google Docs, Notion, and Granola into local Markdown files.
 
 mdexport is a CLI tool that pulls content from your tools and saves it as plain Markdown — readable, searchable, version-controllable. Register your sources once, then sync whenever you need fresh data.
 
@@ -124,6 +124,23 @@ mdexport add notion -n my-notion -o ./output/notion -d DATABASE_ID
 
 Exports pages as Markdown. Share pages/databases with your integration to make them accessible.
 
+#### Granola
+
+```bash
+mdexport add granola -n meetings --token grn_... -p TwinsAI=~/work/twinsai/meetings -p Formula=~/work/formula/meetings
+
+# Only some Granola folders, and send one folder's meetings straight to a place
+mdexport add granola -n meetings --token grn_... -p Formula=~/work/formula/meetings -f fol_ID -l fol_ID=Formula
+
+mdexport granola pending meetings               # meetings waiting for a place, with a guess, as JSON
+mdexport granola file meetings not_ID TwinsAI   # save one; the rest of its series follows
+mdexport granola file meetings not_ID Formula --series     # move a saved meeting and its whole series
+mdexport granola file meetings not_ID Formula --only-this  # move just this one
+mdexport granola places meetings -p Name=folder ...        # change the places
+```
+
+One file per meeting, `YYYY-MM-DD Title.md` named after the calendar event (Granola's note title when there is none), with ` (2)` for a second one that day, with the summary, your own notes and the transcript. A meeting goes to the place chosen for it, else to where its calendar series went before, else to the place linked to its Granola folder; otherwise it waits in `pending` and is not written anywhere. The key is made in Granola under Settings > API (Business plan).
+
 ### `mdexport list` — Show registered exports
 
 ```bash
@@ -230,6 +247,7 @@ Tokens are loaded from environment variables or a `.env` file. See `.env.example
 | Gmail | `GOOGLE_TOKEN` | A Google OAuth token with the `gmail.readonly` scope |
 | Google Docs | `GOOGLE_TOKEN` | Service account, gcloud CLI, or [OAuth playground](https://developers.google.com/oauthplayground) |
 | Notion | `NOTION_TOKEN` | [My integrations](https://www.notion.so/my-integrations) → Create integration (`ntn_...`) |
+| Granola | `GRANOLA_TOKEN` | Granola app → Settings → API → Create key (`grn_...`) |
 
 You can also pass tokens directly via `--token` when adding a source.
 

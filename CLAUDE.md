@@ -32,9 +32,10 @@ All source code lives in `src/mdexport/`. The codebase is small (~15 files):
 - **notion_client.py** — Small Notion REST client over httpx (`Notion-Version: 2022-06-28`), at most 3 calls per second, retrying 429, 5xx and network errors; failures raise `NotionError` with Notion's code, never the token.
 - **notion_render.py** — Renders a Notion page and its blocks as Markdown: a `##` item per heading with its link on the next line, database-row properties, the Slack line escape, no code fences.
 - **notion_export.py** — Stateless `mdexport export notion`: every page shared with the integration as `<root id>/<page id>.md`, re-reading only changed pages, a state file per page in `.state/`, deletion of pages no longer shared or excluded and of root folders left empty, a JSON report; token only from `NOTION_TOKEN`, no registry.
+- **granola.py** - Exports Granola meetings (summary, own notes, transcript) via the public API with a `grn_` key. A meeting goes to one of several named places: one chosen for it, else its calendar series' place, else a linked Granola folder's place; otherwise it waits in `pending` until `mdexport granola file` gives it one. `files`, `series`, `notes` and `pending` live in the registry entry, and `output` is the first place.
 
 Each exporter follows the same pattern: authenticate via env var token → paginate through API → format as markdown → write files. GitHub, Linear, Google Docs, and Notion support incremental sync via `synced_at`.
 
 ## Environment Variables
 
-Tokens are loaded from `.env` (see `.env.example`): `GITHUB_TOKEN`, `SLACK_TOKEN`, `LINEAR_TOKEN`, `GOOGLE_TOKEN` (Google Docs and Gmail), `NOTION_TOKEN`. Telegram takes `TELEGRAM_DC` and `TELEGRAM_AUTH_KEY` instead, set by Notula Collect for the length of one run.
+Tokens are loaded from `.env` (see `.env.example`): `GITHUB_TOKEN`, `SLACK_TOKEN`, `LINEAR_TOKEN`, `GOOGLE_TOKEN` (Google Docs and Gmail), `NOTION_TOKEN`, `GRANOLA_TOKEN`. Telegram takes `TELEGRAM_DC` and `TELEGRAM_AUTH_KEY` instead, set by Notula Collect for the length of one run.
