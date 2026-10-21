@@ -291,20 +291,29 @@ def export_group():
               help="Recent days read again on every run, for edits, deletions and late thread replies")
 @click.option("--exclude", multiple=True, help="Channel id or name (without #) to skip; repeatable")
 @click.option("--exclude-user", multiple=True, help="User id whose messages are left out; repeatable")
+@click.option("--keep-own/--no-keep-own", default=False,
+              help="Keep the token's own bot messages, which are left out by default")
+@click.option("--dms/--no-dms", default=False,
+              help="Export the bot's direct messages instead of channels (needs im:read and im:history)")
 @click.option("--report", type=click.Path(dir_okay=False, path_type=Path), required=True,
               help="File the run's JSON report is written to")
-def export_slack(output, history_days, refetch_days, exclude, exclude_user, report):
+def export_slack(output, history_days, refetch_days, exclude, exclude_user, keep_own, dms, report):
     """Export every Slack channel the token's bot is in, one Markdown file per channel per day.
 
     The token is read only from the SLACK_TOKEN environment variable; a bot
     token (xoxb-...) needs channels:read, groups:read, channels:history,
     groups:history and users:read. The bot never joins a channel by itself.
+    --keep-own keeps the bot's own messages, so a conversation with it is whole.
 
     \b
     Writes OUTPUT/<channel id>/<YYYY-MM-DD>.md and a cursor per channel in
     OUTPUT/.state/. Folders named like a channel id that the bot is no longer
     in, or that are excluded, are deleted; nothing is deleted when no channel
     is kept.
+
+    \b
+    --dms exports the bot's one-to-one direct messages instead, into
+    OUTPUT/<DM id>/<YYYY-MM-DD>.md; it needs im:read and im:history.
 
     \b
     Examples:
@@ -330,14 +339,17 @@ def export_slack(output, history_days, refetch_days, exclude, exclude_user, repo
             refetch_days=refetch_days,
             exclude=exclude,
             exclude_users=exclude_user,
+            keep_own=keep_own,
+            dms=dms,
         )
     except slack_export.ExportError as e:
         raise click.ClickException(str(e)) from e
 
     slack_export._write_atomic(report, json.dumps(result, indent=2) + "\n")
-    summary = f"Exported {result['channels']} channels, {result['messages']} messages, {len(result['unreadable'])} unreadable"
+    key, noun = ("dms", "DMs") if dms else ("channels", "channels")
+    summary = f"Exported {result[key]} {noun}, {result['messages']} messages, {len(result['unreadable'])} unreadable"
     if result.get("removal_skipped"):
-        summary += "; removal skipped: no channels kept"
+        summary += f"; removal skipped: no {noun} kept"
     click.echo(summary)
 
 
