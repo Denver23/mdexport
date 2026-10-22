@@ -35,6 +35,10 @@ def channel(cid: str, name: str, member: bool = True, **extra) -> dict:
     return {"id": cid, "name": name, "is_member": member, **extra}
 
 
+def im(did: str, user: str, **extra) -> dict:
+    return {"id": did, "user": user, "is_im": True, **extra}
+
+
 def run(fake: FakeClient, out, **kwargs) -> dict:
     return export(fake, out, history_days=365, refetch_days=14, now=NOW, **kwargs)
 
@@ -175,7 +179,8 @@ def test_broadcast_reply_not_duplicated(tmp_path):
     assert permalink(BASE, "C01", reply["ts"], parent["ts"]) in text
 
 
-def test_skips_own_bot_excluded_users_and_join_noise_keeps_other_bots(tmp_path):
+def noisy_channel() -> FakeClient:
+    """C01 with the bot's own posts, an excluded user U9, join noise and another bot."""
     fake = FakeClient()
     fake.channels = [channel("C01", "seed")]
     human = msg("2026-10-07", "09:00", "human question", reply_count=2)
@@ -194,7 +199,11 @@ def test_skips_own_bot_excluded_users_and_join_noise_keeps_other_bots(tmp_path):
         msg("2026-10-07", "09:12", "excluded reply", user="U9", thread_ts=human["ts"]),
         msg("2026-10-07", "09:13", "renamed the channel", user="U2", thread_ts=human["ts"], subtype="channel_name"),
     ]}
-    run(fake, tmp_path, exclude_users=("U9",))
+    return fake
+
+
+def test_skips_own_bot_excluded_users_and_join_noise_keeps_other_bots(tmp_path):
+    run(noisy_channel(), tmp_path, exclude_users=("U9",))
     text = text_of(tmp_path, "C01")
     gone_texts = ("own user answer", "own bot post", "excluded user", "has joined", "own thread answer",
                   "excluded reply", "renamed the channel")
@@ -202,6 +211,127 @@ def test_skips_own_bot_excluded_users_and_join_noise_keeps_other_bots(tmp_path):
         assert gone not in text
     for kept in ("human question", "thanks", "## 09:05 UTC · Linear", "FOR-1 moved"):
         assert kept in text
+
+
+def own_threads() -> tuple[FakeClient, dict, dict]:
+    """C01 with a human question the bot answers in its thread, and the bot's own top-level post with a reply."""
+    fake = FakeClient()
+    fake.channels = [channel("C01", "seed")]
+    human = msg("2026-10-07", "09:00", "human question", reply_count=2)
+    own = msg("2026-10-07", "09:01", "own top-level", user="UBOT", reply_count=1)
+    fake.history = {"C01": [human, own]}
+    fake.replies = {
+        ("C01", human["ts"]): [
+            human,
+            msg("2026-10-07", "09:10", "own thread answer", user="UBOT", thread_ts=human["ts"]),
+            msg("2026-10-07", "09:11", "thanks", user="U2", thread_ts=human["ts"]),
+        ],
+        ("C01", own["ts"]): [own, msg("2026-10-07", "09:20", "follow-up", user="U1", thread_ts=own["ts"])],
+    }
+    return fake, human, own
+
+
+def test_keep_own_writes_the_bots_messages_and_replies(tmp_path):
+    fake, human, own = own_threads()
+    run(fake, tmp_path, keep_own=True)
+    text = text_of(tmp_path, "C01")
+    for kept in ("own top-level", "## 09:01 UTC · FormulaBot", "> 09:10 UTC · FormulaBot: own thread answer",
+                 "thanks", "follow-up"):
+        assert kept in text
+    assert {kw["ts"] for m, kw in fake.calls if m == "conversations_replies"} == {human["ts"], own["ts"]}
+
+
+def test_keep_own_names_a_bot_post_without_a_user(tmp_path):
+    fake = FakeClient()
+    fake.channels = [channel("C01", "seed")]
+    fake.history = {"C01": [bot_msg("2026-10-07", "09:02", "own bot post", "BBOT", bot_profile={"name": "FormulaBot"})]}
+    run(fake, tmp_path, keep_own=True)
+    text = text_of(tmp_path, "C01")
+    assert "## 09:02 UTC · FormulaBot" in text
+    assert "own bot post" in text
+
+
+def test_keep_own_still_drops_excluded_users_and_noise(tmp_path):
+    run(noisy_channel(), tmp_path, keep_own=True, exclude_users=("U9",))
+    text = text_of(tmp_path, "C01")
+    for gone in ("excluded user", "has joined", "excluded reply", "renamed the channel"):
+        assert gone not in text
+    for kept in ("own user answer", "own bot post", "own thread answer"):
+        assert kept in text
+
+
+def test_keep_own_respects_explicit_own_user_exclusion(tmp_path):
+    run(noisy_channel(), tmp_path, keep_own=True, exclude_users=iter(("UBOT",)))
+    text = text_of(tmp_path, "C01")
+    for gone in ("own user answer", "own bot post", "own thread answer"):
+        assert gone not in text
+    assert "human question" in text
+    assert "FOR-1 moved" in text
+
+
+@pytest.mark.parametrize("dms", [False, True])
+@pytest.mark.parametrize("first_keep_own", [False, True])
+def test_keep_own_change_refreshes_older_days(tmp_path, dms, first_keep_own):
+    fake = FakeClient()
+    cid = "D01" if dms else "C01"
+    fake.channels = [im(cid, "U1") if dms else channel(cid, "seed")]
+    parent = msg("2026-09-01", "09:00", "old question", reply_count=1)
+    answer = msg("2026-09-01", "09:10", "old bot reply", user="UBOT", thread_ts=parent["ts"])
+    fake.history = {cid: [parent, msg("2026-09-01", "10:00", "old bot post", user="UBOT"),
+                          msg("2026-10-07", "09:00", "recent human message")]}
+    fake.replies = {(cid, parent["ts"]): [parent, answer]}
+    run(fake, tmp_path, dms=dms, keep_own=first_keep_own)
+    export(fake, tmp_path, dms=dms, keep_own=not first_keep_own,
+           history_days=14, refetch_days=14, now=NOW)
+    text = text_of(tmp_path, cid)
+    assert ("old bot post" in text) is not first_keep_own
+    assert ("old bot reply" in text) is not first_keep_own
+    assert "old question" in text
+    before = files(tmp_path / cid)
+    run(fake, tmp_path, dms=dms, keep_own=not first_keep_own)
+    assert files(tmp_path / cid) == before
+    assert fake.history_calls(cid)[-1]["oldest"] == midnight("2026-09-23")
+
+
+def test_keep_own_change_retries_after_unreadable_history(tmp_path):
+    fake = noisy_channel()
+    run(fake, tmp_path)
+    before = files(tmp_path / "C01")
+    state_before = (tmp_path / ".state" / "C01.json").read_bytes()
+    fake.fail = {"C01": "ratelimited"}
+    report = run(fake, tmp_path, keep_own=True)
+    assert report["unreadable"] == {"C01": "ratelimited"}
+    assert files(tmp_path / "C01") == before
+    assert (tmp_path / ".state" / "C01.json").read_bytes() == state_before
+    fake.fail.clear()
+    run(fake, tmp_path, keep_own=True)
+    assert fake.history_calls("C01")[-1]["oldest"] == midnight("2025-10-07")
+    assert "own bot post" in text_of(tmp_path, "C01")
+    assert cursor(tmp_path, "C01")["keep_own"] is True
+
+
+def test_keep_own_escapes_a_fenced_reply(tmp_path):
+    fake = FakeClient()
+    fake.channels = [channel("C01", "seed")]
+    parent = msg("2026-10-07", "09:00", "how do I set x?", reply_count=1)
+    fake.history = {"C01": [parent]}
+    fake.replies = {("C01", parent["ts"]): [
+        parent,
+        msg("2026-10-07", "09:10", "```python\nx = 1\n```", user="UBOT", thread_ts=parent["ts"]),
+    ]}
+    run(fake, tmp_path, keep_own=True)
+    text = (tmp_path / "C01" / "2026-10-07.md").read_text()
+    assert not any(line.lstrip().startswith("```") for line in text.splitlines())
+    assert "FormulaBot: \\```python" in text
+
+
+def test_without_keep_own_nothing_changes(tmp_path):
+    fake, _, _ = own_threads()
+    run(fake, tmp_path)
+    text = text_of(tmp_path, "C01")
+    for gone in ("own top-level", "own thread answer", "follow-up"):
+        assert gone not in text
+    assert "thanks" in text
 
 
 def test_token_without_a_bot_keeps_human_messages(tmp_path):
@@ -436,3 +566,146 @@ def test_never_joins(tmp_path):
     fake.history = {"C01": [msg("2026-10-07", "09:00", "hi")], "C02": [msg("2026-10-07", "09:00", "hi")]}
     run(fake, tmp_path)
     assert [m for m, _ in fake.calls if m == "conversations_join"] == []
+
+
+def test_dms_lists_ims_and_writes_dm_titles(tmp_path):
+    fake = FakeClient()
+    fake.channels = [im("D01", "U1"), im("D02", "U2"), im("D03", "USLACKBOT")]
+    first = msg("2026-10-07", "09:00", "hi bot")
+    fake.history = {"D01": [first], "D02": [msg("2026-10-07", "10:00", "hello", user="U2")],
+                    "D03": [msg("2026-10-07", "11:00", "slackbot tip", user="USLACKBOT")]}
+    report = run(fake, tmp_path, dms=True, keep_own=True)
+    assert folders(tmp_path) == ["D01", "D02"]
+    assert (tmp_path / "D01" / "2026-10-07.md").read_text().startswith(
+        "# DM with Jay, 2026-10-07\nchannel: D01 · shared with another organisation: no")
+    lists = [kw for m, kw in fake.calls if m == "conversations_list"]
+    assert len(lists) == 2
+    assert all(kw["types"] == "im" and "exclude_archived" not in kw for kw in lists)
+    assert report["dms"] == 2
+    assert "channels" not in report
+    assert cursor(tmp_path, "D01") == {"latest_ts": first["ts"], "name": "DM with Jay", "shared": False,
+                                      "keep_own": True}
+
+
+def dm_with_answer() -> tuple[FakeClient, dict, dict]:
+    """D01 with Jay's question and the bot's answer in its thread."""
+    fake = FakeClient()
+    fake.channels = [im("D01", "U1")]
+    question = msg("2026-10-07", "09:00", "question", user="U1", reply_count=1)
+    answer = msg("2026-10-07", "09:05", "answer", user="UBOT", thread_ts=question["ts"])
+    fake.history = {"D01": [question]}
+    fake.replies = {("D01", question["ts"]): [question, answer]}
+    return fake, question, answer
+
+
+def test_dms_second_identical_run_is_byte_identical(tmp_path):
+    fake, question, answer = dm_with_answer()
+    fake.history["D01"].append(msg("2026-10-06", "09:00", "older"))
+    first = run(fake, tmp_path, dms=True, keep_own=True)
+    before = files(tmp_path / "D01")
+    second = run(fake, tmp_path, dms=True, keep_own=True)
+    assert files(tmp_path / "D01") == before
+    assert second == first
+    text = text_of(tmp_path, "D01")
+    assert count(text, question) == 1
+    assert count(text, answer) == 1
+
+
+def test_dms_exclude_by_dm_id_or_user_id(tmp_path):
+    fake = FakeClient()
+    fake.channels = [im("D01", "U1"), im("D02", "U2"), im("D03", "U3")]
+    fake.history = {did: [msg("2026-10-07", "09:00", f"in {did}")] for did in ("D01", "D02", "D03")}
+    report = run(fake, tmp_path, dms=True, exclude=("D01", "U2"))
+    assert folders(tmp_path) == ["D03"]
+    assert report["dms"] == 1
+    assert {kw["channel"] for m, kw in fake.calls if m == "conversations_history"} == {"D03"}
+
+
+def test_dm_with_a_deleted_or_unknown_user_is_kept(tmp_path):
+    fake = FakeClient()
+    fake.channels = [im("D01", "U1", is_user_deleted=True), im("D02", "U77")]
+    fake.history = {"D01": [msg("2026-10-07", "09:00", "last words")],
+                    "D02": [msg("2026-10-07", "10:00", "who am I", user="U77")]}
+    run(fake, tmp_path, dms=True)
+    assert folders(tmp_path) == ["D01", "D02"]
+    assert (tmp_path / "D01" / "2026-10-07.md").read_text().startswith("# DM with Jay, 2026-10-07\n")
+    assert (tmp_path / "D02" / "2026-10-07.md").read_text().startswith("# DM with U77, 2026-10-07\n")
+
+
+def test_dms_keep_own_writes_both_sides(tmp_path):
+    fake, _, _ = dm_with_answer()
+    run(fake, tmp_path, dms=True, keep_own=True)
+    text = text_of(tmp_path, "D01")
+    assert "question" in text
+    assert "> 09:05 UTC · FormulaBot: answer" in text
+
+
+def make_files(out, *paths: str) -> None:
+    for rel in paths:
+        (out / rel).parent.mkdir(parents=True, exist_ok=True)
+        (out / rel).write_text("kept")
+
+
+def test_dm_run_removes_only_unkept_dm_folders(tmp_path):
+    make_files(tmp_path, "D09/2026-10-01.md", ".state/D09.json", "C01/2026-10-01.md", ".state/C01.json", "notes/x.md")
+    fake = FakeClient()
+    fake.channels = [im("D01", "U1")]
+    fake.history = {"D01": [msg("2026-10-07", "09:00", "hi")]}
+    report = run(fake, tmp_path, dms=True)
+    assert report["removed"] == ["D09"]
+    assert folders(tmp_path) == ["C01", "D01", "notes"]
+    assert not (tmp_path / ".state" / "D09.json").exists()
+    for rel in ("C01/2026-10-01.md", ".state/C01.json", "notes/x.md"):
+        assert (tmp_path / rel).read_text() == "kept"
+
+
+def test_channel_run_never_removes_dm_folders(tmp_path):
+    make_files(tmp_path, "D09/2026-10-01.md", ".state/D09.json")
+    fake = FakeClient()
+    fake.channels = [channel("C01", "seed")]
+    fake.history = {"C01": [msg("2026-10-07", "09:00", "hi")]}
+    report = run(fake, tmp_path)
+    assert report["removed"] == []
+    assert (tmp_path / "D09" / "2026-10-01.md").read_text() == "kept"
+    assert (tmp_path / ".state" / "D09.json").exists()
+
+
+def test_dm_run_keeping_nothing_skips_removal(tmp_path):
+    make_files(tmp_path, "D09/2026-10-01.md", ".state/D09.json")
+    fake = FakeClient()
+    fake.channels = [im("D03", "USLACKBOT")]
+    fake.history = {"D03": [msg("2026-10-07", "09:00", "slackbot tip", user="USLACKBOT")]}
+    report = run(fake, tmp_path, dms=True)
+    assert report == {"dms": 0, "messages": 0, "removed": [], "unreadable": {}, "removal_skipped": True}
+    assert report["removal_skipped"] is True
+    assert (tmp_path / "D09" / "2026-10-01.md").read_text() == "kept"
+    assert (tmp_path / ".state" / "D09.json").exists()
+
+
+def test_dm_listing_failure_names_the_dm_listing(tmp_path):
+    make_files(tmp_path, "D09/2026-10-01.md", ".state/D09.json")
+    fake = FakeClient()
+    fake.channels = [im("D01", "U1")]
+    fake.history = {"D01": [msg("2026-10-07", "09:00", "hi")]}
+    fake.list_error = "missing_scope"
+    with pytest.raises(ExportError, match="Slack DM listing failed: missing_scope"):
+        run(fake, tmp_path, dms=True)
+    assert folders(tmp_path) == ["D09"]
+    assert (tmp_path / "D09" / "2026-10-01.md").read_text() == "kept"
+    assert sorted(p.name for p in (tmp_path / ".state").iterdir()) == ["D09.json"]
+    assert fake.history_calls("D01") == []
+
+
+@pytest.mark.parametrize("method", ["auth_test", "users_list"])
+def test_dm_auth_or_user_listing_failure_names_the_dm_listing(tmp_path, method):
+    fake = FakeClient()
+    fake.channels = [im("D01", "U1")]
+
+    def revoked(**kwargs):
+        raise SlackApiError("x", {"ok": False, "error": "invalid_auth"})
+
+    setattr(fake, method, revoked)
+    (tmp_path / "D09").mkdir()
+    with pytest.raises(ExportError, match="Slack DM listing failed: invalid_auth"):
+        run(fake, tmp_path, dms=True)
+    assert folders(tmp_path) == ["D09"]

@@ -1,4 +1,4 @@
-"""Stateless Slack export - one Markdown file per channel per UTC day, with message permalinks."""
+"""Stateless Slack export - one Markdown file per channel or DM per UTC day, with message permalinks."""
 
 import json
 import os
@@ -21,6 +21,7 @@ _TOKEN = re.compile(r"<([^<>]*)>")
 _LINE_OPENERS = ("#", "```", "~~~")
 _BROADCASTS = ("here", "channel", "everyone")
 _CHANNEL_ID = re.compile(r"[CG][A-Z0-9]{2,}")
+_DM_ID = re.compile(r"D[A-Z0-9]{2,}")
 
 
 def permalink(base_url: str, channel_id: str, ts: str, thread_ts: str | None = None) -> str:
@@ -110,7 +111,8 @@ def render_day(channel: dict, day: str, messages: list[dict], users: dict, chann
     """Render one channel's day file; each message's `_replies` follow it as quoted blocks."""
     cid = channel["id"]
     shared = "yes" if channel["shared"] else "no"
-    blocks = [f"# #{channel['name']}, {day}\nchannel: {cid} · shared with another organisation: {shared}"]
+    title = channel["name"] if channel.get("dm") else f"#{channel['name']}"
+    blocks = [f"# {title}, {day}\nchannel: {cid} · shared with another organisation: {shared}"]
     for msg in messages:
         blocks.append(_message_block(msg, cid, users, channels, base_url))
         for reply in msg.get("_replies", []):
@@ -119,7 +121,7 @@ def render_day(channel: dict, day: str, messages: list[dict], users: dict, chann
 
 
 class ExportError(Exception):
-    """The workspace, its users or its channels could not be listed; nothing was written or deleted."""
+    """The workspace, its users or its channels or DMs could not be listed; nothing was written or deleted."""
 
 
 def make_client(token: str) -> WebClient:
@@ -214,9 +216,9 @@ def _write_days(out: Path, channel: dict, messages: list[dict], start: datetime,
     return written
 
 
-def _remove_unkept(out: Path, kept: set[str]) -> list[str]:
-    """Delete every folder named like a channel id that was not kept, with its cursor; return their ids."""
-    folders = (p.name for p in out.iterdir() if p.is_dir() and _CHANNEL_ID.fullmatch(p.name))
+def _remove_unkept(out: Path, kept: set[str], pattern: re.Pattern) -> list[str]:
+    """Delete every folder whose name fully matches `pattern` that was not kept, with its cursor; return their ids."""
+    folders = (p.name for p in out.iterdir() if p.is_dir() and pattern.fullmatch(p.name))
     removed = sorted(name for name in folders if name not in kept)
     for cid in removed:
         shutil.rmtree(out / cid)
@@ -224,30 +226,55 @@ def _remove_unkept(out: Path, kept: set[str]) -> list[str]:
     return removed
 
 
+def _dm(im: dict, users: dict[str, str]) -> dict:
+    """An IM as a conversation named after the other person, or their id when no name is known."""
+    other = im.get("user")
+    return {"id": im["id"], "name": "DM with " + (users.get(other) or other or im["id"]), "shared": False, "dm": True}
+
+
 def export(client, out: Path, *, history_days: int, refetch_days: int, exclude: Iterable[str] = (),
-           exclude_users: Iterable[str] = (), now: datetime | None = None) -> dict:
-    """Export every member channel's window into `out/<id>/<day>.md` and return the run's report."""
+           exclude_users: Iterable[str] = (), keep_own: bool = False, dms: bool = False,
+           now: datetime | None = None) -> dict:
+    """Export every member channel's window, or with `dms` every DM's, into `out/<id>/<day>.md`; return the report."""
     now = now or datetime.now(timezone.utc)
     try:
         auth = client.auth_test()
         users = _resolve_users(client)
-        listed = _pages(client.conversations_list, "channels",
-                        types="public_channel,private_channel", exclude_archived=False)
+        if dms:
+            listed = _pages(client.conversations_list, "channels", types="im")
+        else:
+            listed = _pages(client.conversations_list, "channels",
+                            types="public_channel,private_channel", exclude_archived=False)
     except SlackApiError as e:
-        raise ExportError(f"Slack channel listing failed: {e.response['error']}") from e
-    base_url, bot_id = auth["url"], auth.get("bot_id")
-    skip_users = {auth["user_id"], *exclude_users}
+        raise ExportError(f"Slack {'DM' if dms else 'channel'} listing failed: {e.response['error']}") from e
+    base_url = auth["url"]
+    # The token's own posts are left out unless asked for; excluded users and noise are always dropped.
+    skip_users = set(exclude_users)
+    keep_own = keep_own and auth["user_id"] not in skip_users
+    bot_id = None if keep_own else auth.get("bot_id")
+    if not keep_own:
+        skip_users.add(auth["user_id"])
     names = {c["id"]: c.get("name") or c["id"] for c in listed}
     excluded = set(exclude)
-    kept = [c for c in listed if c.get("is_member") and c["id"] not in excluded and c.get("name") not in excluded]
+    if dms:
+        # IMs carry no membership; every one but Slackbot's and the excluded ids or users is kept.
+        kept = [_dm(c, users) for c in listed
+                if c.get("user") != "USLACKBOT" and c["id"] not in excluded and c.get("user") not in excluded]
+    else:
+        kept = [{"id": c["id"], "name": names[c["id"]],
+                 "shared": bool(c.get("is_ext_shared") or c.get("is_pending_ext_shared"))}
+                for c in listed if c.get("is_member") and c["id"] not in excluded and c.get("name") not in excluded]
     out.mkdir(parents=True, exist_ok=True)
-    report = {"channels": len(kept), "messages": 0, "removed": [], "unreadable": {}}
-    for listing in kept:
-        cid = listing["id"]
-        channel = {"id": cid, "name": names[cid],
-                   "shared": bool(listing.get("is_ext_shared") or listing.get("is_pending_ext_shared"))}
-        old_ts = _read_cursor(out, cid).get("latest_ts") or None
+    report = {"dms" if dms else "channels": len(kept), "messages": 0, "removed": [], "unreadable": {}}
+    for channel in kept:
+        cid = channel["id"]
+        state = _read_cursor(out, cid)
+        old_ts = state.get("latest_ts") or None
         start = window_start(now, old_ts, history_days, refetch_days)
+        if state.get("keep_own", False) != keep_own:
+            start = min(start, window_start(now, None, history_days, refetch_days))
+            for path in (out / cid).glob("????-??-??.md"):
+                start = min(start, datetime.fromisoformat(path.stem).replace(tzinfo=timezone.utc))
         try:
             messages = _fetch(client, cid, start, skip_users, bot_id)
         except SlackApiError as e:
@@ -257,9 +284,13 @@ def export(client, out: Path, *, history_days: int, refetch_days: int, exclude: 
         report["messages"] += _write_days(out, channel, messages, start, now, users, names, base_url)
         stamps = [m["ts"] for m in messages] + [r["ts"] for m in messages for r in m.get("_replies", [])]
         latest = max(stamps, key=float) if stamps else old_ts or ""
-        _write_cursor(out, cid, {"latest_ts": latest, "name": channel["name"], "shared": channel["shared"]})
+        state = {"latest_ts": latest, "name": channel["name"], "shared": channel["shared"]}
+        if keep_own:
+            state["keep_own"] = True
+        _write_cursor(out, cid, state)
     if kept:
-        report["removed"] = _remove_unkept(out, {c["id"] for c in kept})
+        # Each mode deletes only folders of its own id shape, never the other mode's.
+        report["removed"] = _remove_unkept(out, {c["id"] for c in kept}, _DM_ID if dms else _CHANNEL_ID)
     else:
         # A listing that kept nothing (wrong workspace, bot removed everywhere) never wipes the export.
         report["removal_skipped"] = True

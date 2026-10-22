@@ -18,16 +18,18 @@ def _error(code: str) -> SlackApiError:
 
 
 class FakeClient:
-    """`fail[cid]` makes that channel's history raise; `list_fail_page` makes that 1-based listing page raise."""
+    """`fail[cid]` makes that channel's history raise, `list_fail_page` that 1-based listing page, `list_error` every listing."""
 
     def __init__(self):
         self.auth = {"url": "https://formulagrowth.slack.com/", "user_id": "UBOT", "bot_id": "BBOT"}
-        self.members = [{"id": "U1", "real_name": "Jay"}, {"id": "U2", "real_name": "Alex"}]
+        self.members = [{"id": "U1", "real_name": "Jay"}, {"id": "U2", "real_name": "Alex"},
+                        {"id": "UBOT", "real_name": "FormulaBot"}]
         self.channels = []
         self.history = {}
         self.replies = {}
         self.fail = {}
         self.list_fail_page = None
+        self.list_error = None
         self.calls = []
 
     def auth_test(self, **kwargs):
@@ -40,6 +42,8 @@ class FakeClient:
 
     def conversations_list(self, **kwargs):
         self.calls.append(("conversations_list", kwargs))
+        if self.list_error:
+            raise _error(self.list_error)
         if self.list_fail_page == int(kwargs.get("cursor") or 0) // PAGE + 1:
             raise _error("internal_error")
         resp = _page(self.channels, kwargs.get("cursor"))

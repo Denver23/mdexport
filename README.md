@@ -187,9 +187,9 @@ SLACK_TOKEN=xoxb-... mdexport export slack -o ./slack --report ./slack-report.js
   --history-days 90 --refetch-days 7 --exclude random --exclude C0123ABCD --exclude-user U0456EFGH
 ```
 
-Options: `--history-days` days read on a channel's first run (default: 365), `--refetch-days` recent days read again on every run to pick up edits, deletions and late thread replies (default: 14, at most `--history-days`), `--exclude` channel id or name without `#` (repeatable), `--exclude-user` user id (repeatable), `--report` file for the JSON report (required).
+Options: `--history-days` days read on a channel's first run (default: 365), `--refetch-days` recent days read again on every run to pick up edits, deletions and late thread replies (default: 14, at most `--history-days`), `--exclude` channel id or name without `#` (repeatable), `--exclude-user` user id (repeatable), `--keep-own` keeps the bot's own messages, `--dms` exports the bot's direct messages instead of channels, `--report` file for the JSON report (required).
 
-Exports every channel the token's bot is a member of; the bot never joins a channel by itself, so invite it where it should read. The token comes only from `SLACK_TOKEN` and is never printed or stored. A bot token (`xoxb-...`) needs `channels:read`, `groups:read`, `channels:history`, `groups:history` and `users:read`. The bot's own messages are always left out. Nothing is read from or written to `~/.mdexport/registry.json`.
+Exports every channel the token's bot is a member of; the bot never joins a channel by itself, so invite it where it should read. The token comes only from `SLACK_TOKEN` and is never printed or stored. A bot token (`xoxb-...`) needs `channels:read`, `groups:read`, `channels:history`, `groups:history` and `users:read`. The bot's own messages are left out unless `--keep-own` is given. Nothing is read from or written to `~/.mdexport/registry.json`.
 
 Writes one file per channel per UTC day, `OUTPUT/<channel id>/<YYYY-MM-DD>.md`, with a link to every message, and a cursor per channel in `OUTPUT/.state/`. **The output directory is dedicated to this export:** each run deletes the folders named like a channel id (`C…`/`G…`) that the bot is no longer in or that are excluded. When a run keeps no channel at all (wrong workspace, bot removed everywhere), nothing is deleted.
 
@@ -204,6 +204,8 @@ Exported 2 channels, 120 messages, 1 unreadable
 ```
 
 A channel that cannot be read is listed under `unreadable` and keeps its earlier files. A run that keeps no channel adds `"removal_skipped": true` to the report and `; removal skipped: no channels kept` to the line. If the workspace, its users or its channels cannot be listed, the command exits 1, writes no report and changes nothing.
+
+With `--dms` the run exports the bot's one-to-one direct messages instead of channels: every DM it has, deactivated users' included, except Slackbot's and those whose DM id or user id is given to `--exclude`. It needs `im:read`, `im:history` and `users:read`. Day files go to `OUTPUT/<DM id>/<YYYY-MM-DD>.md`, titled `# DM with <name>, <YYYY-MM-DD>` (the user id when no name is known). A DM run deletes only unkept folders named like a DM id (`D…`), and a channel run never deletes one. The report has `dms` in place of `channels`, and the line reads `Exported 3 DMs, 40 messages, 0 unreadable`, ending `; removal skipped: no DMs kept` when no DM is kept. A failed listing exits 1 with `Slack DM listing failed: <error>`, such as `missing_scope` without `im:read`.
 
 ### `mdexport export notion` — One-off Notion export
 

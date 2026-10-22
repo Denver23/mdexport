@@ -99,6 +99,18 @@ def test_options_reach_export(tmp_path, env):
     assert 29 * 86400 < time.time() - oldest < 31 * 86400
 
 
+def test_keep_own_reaches_the_export(tmp_path, env, monkeypatch):
+    seen = []
+    zeros = {"channels": 0, "messages": 0, "removed": [], "unreadable": {}, "removal_skipped": True}
+    monkeypatch.setattr(slack_export, "export", lambda client, out, **kw: seen.append(kw) or zeros)
+    result = invoke(tmp_path, "--keep-own")
+    assert result.exit_code == 0, result.output
+    assert seen[-1]["keep_own"] is True
+    result = invoke(tmp_path)
+    assert result.exit_code == 0, result.output
+    assert seen[-1]["keep_own"] is False
+
+
 def test_removal_skipped_is_echoed(tmp_path, env):
     fake, _ = env
     fake.channels = [{"id": "C01", "name": "general", "is_member": False}]
@@ -106,6 +118,27 @@ def test_removal_skipped_is_echoed(tmp_path, env):
     assert result.exit_code == 0, result.output
     assert result.output == "Exported 0 channels, 0 messages, 0 unreadable; removal skipped: no channels kept\n"
     assert json.loads((tmp_path / "report.json").read_text())["removal_skipped"] is True
+
+
+def test_dms_summary_and_flag(tmp_path, env):
+    fake, _ = env
+    fake.channels = [{"id": "D01", "user": "U1", "is_im": True}]
+    fake.history = {"D01": [recent_msg("hi bot")]}
+    result = invoke(tmp_path, "--dms", "--keep-own")
+    assert result.exit_code == 0, result.output
+    assert result.output == "Exported 1 DMs, 1 messages, 0 unreadable\n"
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report == {"dms": 1, "messages": 1, "removed": [], "unreadable": {}}
+    assert all(kw["types"] == "im" for m, kw in fake.calls if m == "conversations_list")
+
+
+def test_dms_removal_skipped_summary(tmp_path, env):
+    fake, _ = env
+    fake.channels = [{"id": "D03", "user": "USLACKBOT", "is_im": True}]
+    result = invoke(tmp_path, "--dms")
+    assert result.exit_code == 0, result.output
+    assert result.output.endswith("; removal skipped: no DMs kept\n")
+    assert result.output == "Exported 0 DMs, 0 messages, 0 unreadable; removal skipped: no DMs kept\n"
 
 
 def test_listing_failure_exits_1(tmp_path, env):
@@ -131,7 +164,8 @@ def test_make_client_retries_rate_limits_and_server_errors():
 def test_help_lists_every_option():
     result = CliRunner().invoke(cli, ["export", "slack", "--help"])
     assert result.exit_code == 0
-    for option in ("--output", "--history-days", "--refetch-days", "--exclude", "--exclude-user", "--report"):
+    for option in ("--output", "--history-days", "--refetch-days", "--exclude", "--exclude-user", "--keep-own",
+                   "--dms", "--report"):
         assert option in result.output
     assert "dedicated" in result.output
     assert "--token" not in result.output
