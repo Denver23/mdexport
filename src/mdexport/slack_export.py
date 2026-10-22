@@ -249,10 +249,11 @@ def export(client, out: Path, *, history_days: int, refetch_days: int, exclude: 
         raise ExportError(f"Slack {'DM' if dms else 'channel'} listing failed: {e.response['error']}") from e
     base_url = auth["url"]
     # The token's own posts are left out unless asked for; excluded users and noise are always dropped.
-    if keep_own:
-        skip_users, bot_id = set(exclude_users), None
-    else:
-        skip_users, bot_id = {auth["user_id"], *exclude_users}, auth.get("bot_id")
+    skip_users = set(exclude_users)
+    keep_own = keep_own and auth["user_id"] not in skip_users
+    bot_id = None if keep_own else auth.get("bot_id")
+    if not keep_own:
+        skip_users.add(auth["user_id"])
     names = {c["id"]: c.get("name") or c["id"] for c in listed}
     excluded = set(exclude)
     if dms:
@@ -267,8 +268,13 @@ def export(client, out: Path, *, history_days: int, refetch_days: int, exclude: 
     report = {"dms" if dms else "channels": len(kept), "messages": 0, "removed": [], "unreadable": {}}
     for channel in kept:
         cid = channel["id"]
-        old_ts = _read_cursor(out, cid).get("latest_ts") or None
+        state = _read_cursor(out, cid)
+        old_ts = state.get("latest_ts") or None
         start = window_start(now, old_ts, history_days, refetch_days)
+        if state.get("keep_own", False) != keep_own:
+            start = min(start, window_start(now, None, history_days, refetch_days))
+            for path in (out / cid).glob("????-??-??.md"):
+                start = min(start, datetime.fromisoformat(path.stem).replace(tzinfo=timezone.utc))
         try:
             messages = _fetch(client, cid, start, skip_users, bot_id)
         except SlackApiError as e:
@@ -278,7 +284,10 @@ def export(client, out: Path, *, history_days: int, refetch_days: int, exclude: 
         report["messages"] += _write_days(out, channel, messages, start, now, users, names, base_url)
         stamps = [m["ts"] for m in messages] + [r["ts"] for m in messages for r in m.get("_replies", [])]
         latest = max(stamps, key=float) if stamps else old_ts or ""
-        _write_cursor(out, cid, {"latest_ts": latest, "name": channel["name"], "shared": channel["shared"]})
+        state = {"latest_ts": latest, "name": channel["name"], "shared": channel["shared"]}
+        if keep_own:
+            state["keep_own"] = True
+        _write_cursor(out, cid, state)
     if kept:
         # Each mode deletes only folders of its own id shape, never the other mode's.
         report["removed"] = _remove_unkept(out, {c["id"] for c in kept}, _DM_ID if dms else _CHANNEL_ID)

@@ -260,6 +260,56 @@ def test_keep_own_still_drops_excluded_users_and_noise(tmp_path):
         assert kept in text
 
 
+def test_keep_own_respects_explicit_own_user_exclusion(tmp_path):
+    run(noisy_channel(), tmp_path, keep_own=True, exclude_users=iter(("UBOT",)))
+    text = text_of(tmp_path, "C01")
+    for gone in ("own user answer", "own bot post", "own thread answer"):
+        assert gone not in text
+    assert "human question" in text
+    assert "FOR-1 moved" in text
+
+
+@pytest.mark.parametrize("dms", [False, True])
+@pytest.mark.parametrize("first_keep_own", [False, True])
+def test_keep_own_change_refreshes_older_days(tmp_path, dms, first_keep_own):
+    fake = FakeClient()
+    cid = "D01" if dms else "C01"
+    fake.channels = [im(cid, "U1") if dms else channel(cid, "seed")]
+    parent = msg("2026-09-01", "09:00", "old question", reply_count=1)
+    answer = msg("2026-09-01", "09:10", "old bot reply", user="UBOT", thread_ts=parent["ts"])
+    fake.history = {cid: [parent, msg("2026-09-01", "10:00", "old bot post", user="UBOT"),
+                          msg("2026-10-07", "09:00", "recent human message")]}
+    fake.replies = {(cid, parent["ts"]): [parent, answer]}
+    run(fake, tmp_path, dms=dms, keep_own=first_keep_own)
+    export(fake, tmp_path, dms=dms, keep_own=not first_keep_own,
+           history_days=14, refetch_days=14, now=NOW)
+    text = text_of(tmp_path, cid)
+    assert ("old bot post" in text) is not first_keep_own
+    assert ("old bot reply" in text) is not first_keep_own
+    assert "old question" in text
+    before = files(tmp_path / cid)
+    run(fake, tmp_path, dms=dms, keep_own=not first_keep_own)
+    assert files(tmp_path / cid) == before
+    assert fake.history_calls(cid)[-1]["oldest"] == midnight("2026-09-23")
+
+
+def test_keep_own_change_retries_after_unreadable_history(tmp_path):
+    fake = noisy_channel()
+    run(fake, tmp_path)
+    before = files(tmp_path / "C01")
+    state_before = (tmp_path / ".state" / "C01.json").read_bytes()
+    fake.fail = {"C01": "ratelimited"}
+    report = run(fake, tmp_path, keep_own=True)
+    assert report["unreadable"] == {"C01": "ratelimited"}
+    assert files(tmp_path / "C01") == before
+    assert (tmp_path / ".state" / "C01.json").read_bytes() == state_before
+    fake.fail.clear()
+    run(fake, tmp_path, keep_own=True)
+    assert fake.history_calls("C01")[-1]["oldest"] == midnight("2025-10-07")
+    assert "own bot post" in text_of(tmp_path, "C01")
+    assert cursor(tmp_path, "C01")["keep_own"] is True
+
+
 def test_keep_own_escapes_a_fenced_reply(tmp_path):
     fake = FakeClient()
     fake.channels = [channel("C01", "seed")]
@@ -533,7 +583,8 @@ def test_dms_lists_ims_and_writes_dm_titles(tmp_path):
     assert all(kw["types"] == "im" and "exclude_archived" not in kw for kw in lists)
     assert report["dms"] == 2
     assert "channels" not in report
-    assert cursor(tmp_path, "D01") == {"latest_ts": first["ts"], "name": "DM with Jay", "shared": False}
+    assert cursor(tmp_path, "D01") == {"latest_ts": first["ts"], "name": "DM with Jay", "shared": False,
+                                      "keep_own": True}
 
 
 def dm_with_answer() -> tuple[FakeClient, dict, dict]:
