@@ -12,23 +12,23 @@ MAX_ATTEMPTS = 5
 _COMMENT = "id url body createdAt parent { id } user { name } botActor { name } externalUser { name }"
 TEAMS = """query($after: String) { teams(first: 100, after: $after, includeArchived: true) {
   nodes { key name private } pageInfo { hasNextPage endCursor } } }"""
+_PAGE_INFO = "pageInfo { hasNextPage endCursor }"
+# Each task connection's node fields and its page size in ISSUES; a connection with more pages is read on by ISSUE_PAGE.
+_CONNECTIONS = {"labels": ("name", 50), "children": ("identifier title", 100),
+                "relations": ("type relatedIssue { identifier title }", 50),
+                "inverseRelations": ("type issue { identifier title }", 50),
+                "attachments": ("title url", 50), "comments": (_COMMENT, 100)}
 ISSUES = """query($after: String) { issues(first: 100, after: $after, includeArchived: true, orderBy: createdAt,
   filter: { team: { private: { eq: false } } }) { nodes {
   id identifier title description url priorityLabel estimate trashed archivedAt
   createdAt updatedAt startedAt completedAt canceledAt
   state { name type } team { key name } assignee { name } creator { name }
-  project { name } projectMilestone { name } cycle { number name }
-  labels(first: 50) { nodes { name } } parent { identifier title }
-  children(first: 100) { nodes { identifier title } }
-  relations(first: 50) { nodes { type relatedIssue { identifier title } } }
-  inverseRelations(first: 50) { nodes { type issue { identifier title } } }
-  attachments(first: 50) { nodes { title url } }
-  comments(first: 100) { nodes { %s } pageInfo { hasNextPage endCursor } }
-  } pageInfo { hasNextPage endCursor } } }""" % _COMMENT
-ISSUE_COMMENTS = """query($id: String!, $after: String) { issue(id: $id) {
-  comments(first: 100, after: $after) { nodes { %s } pageInfo { hasNextPage endCursor } } } }""" % _COMMENT
-
-_CONNECTIONS = ("labels", "children", "relations", "inverseRelations", "attachments")
+  project { name } projectMilestone { name } cycle { number name } parent { identifier title }
+  %s
+  } %s } }""" % ("\n  ".join("%s(first: %d) { nodes { %s } %s }" % (key, size, fields, _PAGE_INFO)
+                                for key, (fields, size) in _CONNECTIONS.items()), _PAGE_INFO)
+ISSUE_PAGE = """query($id: String!, $after: String) { issue(id: $id) {
+  %s(first: 100, after: $after) { nodes { %s } """ + _PAGE_INFO + """ } } }"""
 
 
 class LinearError(Exception):
@@ -133,15 +133,14 @@ class LinearClient:
         return self._nodes(TEAMS, ("teams",), {})
 
     def issues(self) -> list[dict]:
-        """Every task of every public team, connections flattened to lists and every comment fetched."""
+        """Every task of every public team, each connection flattened to a list with all of its pages."""
         tasks = self._nodes(ISSUES, ("issues",), {})
         for task in tasks:
-            for key in _CONNECTIONS:
+            for key, (fields, _) in _CONNECTIONS.items():
+                after = _next_cursor(task[key]["pageInfo"])
                 task[key] = task[key]["nodes"]
-            after = _next_cursor(task["comments"]["pageInfo"])
-            task["comments"] = task["comments"]["nodes"]
-            if after:
-                task["comments"] += self._nodes(ISSUE_COMMENTS, ("issue", "comments"), {"id": task["id"]}, after)
+                if after:
+                    task[key] += self._nodes(ISSUE_PAGE % (key, fields), ("issue", key), {"id": task["id"]}, after)
         return tasks
 
     def close(self) -> None:

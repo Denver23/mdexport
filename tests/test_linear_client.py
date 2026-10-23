@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from mdexport.linear_client import LinearClient, LinearError
+from mdexport.linear_client import ISSUES, LinearClient, LinearError
 
 
 class Script:
@@ -40,12 +40,14 @@ def page(key: str, nodes: list, cursor: str | None = None) -> httpx.Response:
     return ok({"data": {key: {"nodes": nodes, "pageInfo": info}}})
 
 
+LAST = {"hasNextPage": False, "endCursor": None}
+CONNECTIONS = ("labels", "children", "relations", "inverseRelations", "attachments", "comments")
+
+
 def node(task_id: str, **fields) -> dict:
-    """A raw task node as GraphQL returns it, with every connection empty unless given."""
+    """A raw task node as GraphQL returns it, with every connection an empty last page unless given."""
     raw = {"id": task_id, "identifier": f"FOR-{task_id}", "assignee": None,
-           "labels": {"nodes": []}, "children": {"nodes": []}, "relations": {"nodes": []},
-           "inverseRelations": {"nodes": []}, "attachments": {"nodes": []},
-           "comments": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+           **{key: {"nodes": [], "pageInfo": LAST} for key in CONNECTIONS}}
     return {**raw, **fields}
 
 
@@ -101,8 +103,9 @@ def test_connections_flattened():
     relations = [{"type": "related", "relatedIssue": {"identifier": "FOR-3", "title": "Other"}}]
     inverse = [{"type": "blocks", "issue": {"identifier": "FOR-4", "title": "Blocker"}}]
     attachments = [{"title": "PR", "url": "https://github.com/x/y/pull/1"}]
-    raw = node("1", labels={"nodes": labels}, children={"nodes": children}, relations={"nodes": relations},
-               inverseRelations={"nodes": inverse}, attachments={"nodes": attachments},
+    raw = node("1", labels={"nodes": labels, "pageInfo": LAST}, children={"nodes": children, "pageInfo": LAST},
+               relations={"nodes": relations, "pageInfo": LAST}, inverseRelations={"nodes": inverse, "pageInfo": LAST},
+               attachments={"nodes": attachments, "pageInfo": LAST},
                comments={"nodes": [comment("k")], "pageInfo": {"hasNextPage": False, "endCursor": "z"}})
     client, _ = make(Script(page("issues", [raw])))
     (task,) = client.issues()
@@ -126,6 +129,47 @@ def test_issue_comments_paged():
     follow_up = body(script.requests[1])
     assert "issue(id: $id)" in follow_up["query"]
     assert follow_up["variables"] == {"id": "issue-uuid", "after": "k1"}
+
+
+METADATA = {"labels": {"name": "bug"}, "children": {"identifier": "FOR-2", "title": "Child"},
+            "relations": {"type": "related", "relatedIssue": {"identifier": "FOR-3", "title": "Other"}},
+            "inverseRelations": {"type": "blocks", "issue": {"identifier": "FOR-4", "title": "Blocker"}},
+            "attachments": {"title": "PR", "url": "https://github.com/x/y/pull/1"}}
+
+
+@pytest.mark.parametrize("key", list(METADATA))
+def test_metadata_connection_paged(key):
+    first, rest = dict(METADATA[key]), [dict(METADATA[key]), dict(METADATA[key])]
+    raw = node("issue-uuid", **{key: {"nodes": [first], "pageInfo": {"hasNextPage": True, "endCursor": "m1"}}})
+    pages = [{key: {"nodes": [rest[0]], "pageInfo": {"hasNextPage": True, "endCursor": "m2"}}},
+             {key: {"nodes": [rest[1]], "pageInfo": LAST}}]
+    script = Script(page("issues", [raw]), *(ok({"data": {"issue": p}}) for p in pages))
+    client, _ = make(script)
+    (task,) = client.issues()
+    assert task[key] == [first, *rest]
+    follow_ups = [body(r) for r in script.requests[1:]]
+    assert [f["variables"] for f in follow_ups] == [{"id": "issue-uuid", "after": "m1"},
+                                                    {"id": "issue-uuid", "after": "m2"}]
+    assert all("issue(id: $id)" in f["query"] and f"{key}(first: 100, after: $after)" in f["query"]
+               for f in follow_ups)
+
+
+def test_issues_query_asks_every_connection_for_its_page_info():
+    for key in CONNECTIONS:
+        start = ISSUES.index(f"{key}(first: ")
+        assert "pageInfo { hasNextPage endCursor }" in ISSUES[start:ISSUES.index("\n", start)]
+
+
+@pytest.mark.parametrize("cursor", [None, ""])
+def test_metadata_missing_cursor_raises(cursor):
+    raw = node("1", attachments={"nodes": [METADATA["attachments"]],
+                                 "pageInfo": {"hasNextPage": True, "endCursor": cursor}})
+    script = Script(page("issues", [raw]), ok({"data": {"issue": {"attachments": {"nodes": [], "pageInfo": LAST}}}}))
+    client, _ = make(script)
+    with pytest.raises(LinearError) as caught:
+        client.issues()
+    assert (caught.value.status, caught.value.code) == (200, "missing_cursor")
+    assert len(script.requests) == 1
 
 
 def no_cursor(key: str, nodes: list, cursor: str | None) -> httpx.Response:
